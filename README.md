@@ -14,6 +14,19 @@ Run Andrej Karpathy's nanochat speedrun on Modal GPUs with persistent storage fo
 - A Modal account and configured CLI (`modal setup`)
 - Access to a GPU that matches your plan (defaults to `H100:8`)
 
+## Install Modal CLI
+If `modal` is not on your PATH, install it locally:
+
+```bash
+python3 -m pip install --user modal
+```
+
+Then authenticate:
+
+```bash
+modal token new
+```
+
 ## Quick start
 ```bash
 modal run speedrun-d12.py
