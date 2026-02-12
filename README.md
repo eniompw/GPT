@@ -11,6 +11,7 @@ Run Andrej Karpathy's nanochat speedrun on Modal GPUs with persistent storage fo
 - Automatically resumes if a checkpoint exists
 - Provides a 10-step smoke test for quick validation
 - Uses NVIDIA CUDA + cuDNN base image for full GPU library support
+- **Robust dependency management**: Manually installs NVIDIA library wheels to prevent `torch` vs system library version mismatches.
 
 ## Prerequisites
 - A Modal account and configured CLI (`modal setup`)
@@ -61,7 +62,7 @@ modal run speedrun-d12.py --task run
 ### Checkpoint frequency
 The code is configured to save checkpoints **every 100 steps** by default. This is controlled in two ways:
 
-1. **Patching `speedrun.sh`**: The script automatically injects `--eval_interval=100 --always_save_checkpoint=True` into training commands
+1. **Patching `speedrun.sh`**: The script automatically injects `--eval-every=100 --save-every=100` into training commands
 2. **Direct arguments**: When resuming or running tests, these flags are passed explicitly
 
 To change the frequency, modify `eval_interval` in the `_patch_speedrun_for_checkpoints()` call inside `speedrun-d12.py`:
@@ -134,24 +135,26 @@ Or add a CLI argument by modifying the entrypoint.
 
 ## Troubleshooting
 
-### `libcudart.so` or `libcudnn.so` errors
-**Fixed in current version.** The code uses `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04` which includes all required libraries.
+### `libcudart.so` / `libnvshmem_host.so` / `undefined symbol` errors
+**Fixed in current version.**
+- We explicitly install all NVIDIA library wheels (`nvidia-cudart-cu12`, `nvidia-nvshmem-cu12`, etc.) into the `uv` environment.
+- We inject `LD_LIBRARY_PATH` dynamically to prioritize these wheels over system libraries.
+- This prevents version mismatches between PyTorch (which expects newer CUDA libs) and the base image.
 
-### `libcusparseLt.so.0` missing
-**Fixed in current version.** The `_ensure_uv_env_has_cuda_bits()` function installs `nvidia-cusparselt-cu12` into the `uv` virtual environment.
+### `Multiple top-level packages discovered` error
+**Fixed in current version.**
+- Removed `uv pip install -e .` which caused issues with the flat repo structure.
+- Replaced with `PYTHONPATH` injection and a `.pth` file in site-packages.
+
+### `base_train.py: error: unrecognized arguments`
+**Fixed in current version.**
+- The smoke test now correctly identifies usage of `scripts/base_train.py` (new argument style) vs `train.py` (old style).
+- Correctly maps arguments like `--max_iters` to `--num-iterations` and `--eval_interval` to `--eval-every` for the new script format.
 
 ### GPU not available or queuing
 H100s are high-demand. If your job queues for >5 minutes:
 - Switch to `A100:8` or `H100:4`
 - Check Modal dashboard for GPU availability
-
-### Checkpoint not resuming
-Verify the checkpoint exists:
-```bash
-modal volume ls nanochat-persistent-storage runs/d12/
-```
-
-If `ckpt.pt` is present but resume fails, check that the model config matches (e.g., don't resume a `d12` run with `--model d32`).
 
 ## Cost estimation
 - **8x H100**: ~$40-50/hour
@@ -170,9 +173,9 @@ def custom_train():
     _ensure_uv_env_has_cuda_bits(repo_dir)
 
     # Run only base pretraining with custom args
-    _uv_run(repo_dir, 
-        "python scripts/base_train.py config/d12.py "
-        "--max_iters=5000 --eval_interval=100 --batch_size=64"
+    _uv_run(repo_dir,
+        "python scripts/base_train.py --run=d12_test "
+        "--num-iterations=5000 --eval-every=100 --device-batch-size=8"
     )
     vol.commit()
 ```
