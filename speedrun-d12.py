@@ -17,7 +17,8 @@ DATA_DIR = VOL_PATH / "data"
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git", "curl", "wget", "build-essential", "pkg-config", "findutils")
-    .pip_install("uv")
+    .pip_install("uv", "transformers", "tiktoken") # Added explicit deps just in case
+    .env({"WANDB_MODE": "disabled"})
 )
 
 def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
@@ -76,11 +77,11 @@ def _ensure_uv_env_has_cuda_bits(repo_dir: Path) -> None:
         "nvidia-cublas-cu12", "nvidia-cudnn-cu12", "nvidia-cufft-cu12", "nvidia-curand-cu12",
         "nvidia-cusolver-cu12", "nvidia-cusparse-cu12", "nvidia-cusparselt-cu12",
         "nvidia-nccl-cu12", "nvidia-nvtx-cu12", "nvidia-nvjitlink-cu12", "nvidia-nvshmem-cu12",
+        "triton",
     ]
     _run(f"uv pip install {' '.join(packages)}", cwd=repo_dir)
 
 def _uv_run(repo_dir: Path, cmd: str) -> None:
-    # Fixed helper script - properly handle None __file__ attributes
     helper_script_path = repo_dir / "find_nvidia_libs.py"
     if not helper_script_path.exists():
         with open(helper_script_path, "w") as f:
@@ -112,17 +113,54 @@ if __name__ == '__main__':
         ).strip()
 
         sys_cuda = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
-        full_cmd = f"export LD_LIBRARY_PATH={lib_paths}:{sys_cuda}:$LD_LIBRARY_PATH && export PYTHONPATH={repo_dir}:$PYTHONPATH && uv run --no-sync {cmd}"
+        # Disable tokenizers parallelism to avoid deadlocks in forks
+        full_cmd = f"export TOKENIZERS_PARALLELISM=false && export WANDB_MODE=disabled && export LD_LIBRARY_PATH={lib_paths}:{sys_cuda}:$LD_LIBRARY_PATH && export PYTHONPATH={repo_dir}:$PYTHONPATH && uv run --no-sync {cmd}"
         _run(full_cmd, cwd=repo_dir)
     except subprocess.CalledProcessError:
-        _run(f"export PYTHONPATH={repo_dir}:$PYTHONPATH && uv run {cmd}", cwd=repo_dir)
+        _run(f"export WANDB_MODE=disabled && export PYTHONPATH={repo_dir}:$PYTHONPATH && uv run {cmd}", cwd=repo_dir)
 
 def _patch_speedrun_for_checkpoints(repo_dir: Path, eval_interval: int = 100) -> None:
     sr = repo_dir / "speedrun.sh"
     if not sr.exists(): return
-    flags = f" --eval_interval={eval_interval} --always_save_checkpoint=True"
+
+    flags = f" --eval-every={eval_interval} --save-every={eval_interval}"
+
+    _run("sed -i '1 a export WANDB_MODE=disabled' speedrun.sh", cwd=repo_dir)
+
     for needle in ["scripts.base_train", "scripts.mid_train", "scripts.chat_sft", "python -m", "uv run"]:
         _run(f"grep -q '{needle}' speedrun.sh && sed -i '/{needle}/ s/$/{flags}/' speedrun.sh || true", cwd=repo_dir)
+
+def _ensure_tokenizer(repo_dir: Path) -> None:
+    print("Ensuring tokenizer is present...")
+    tokenizer_dir = Path("/root/.cache/nanochat/tokenizer")
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+
+    files = {
+        "tokenizer.pkl": "https://huggingface.co/karpathy/nanochat-d32/resolve/main/tokenizer.pkl",
+        "token_bytes.pt": "https://huggingface.co/karpathy/nanochat-d32/resolve/main/token_bytes.pt"
+    }
+
+    for filename, url in files.items():
+        filepath = tokenizer_dir / filename
+        if not filepath.exists():
+            print(f"Downloading {filename}...")
+            subprocess.run(["curl", "-L", "-o", str(filepath), url], check=True)
+        else:
+            print(f"{filename} already exists.")
+
+def _ensure_dataset(repo_dir: Path, num_shards: int = 2) -> None:
+    print("Ensuring dataset is present...")
+    # nanochat expects parquet shards in ~/.cache/nanochat/base_data/
+    # named shard_XXXXX.parquet. The last shard is used for validation,
+    # so we need at least 2. Run the built-in dataset download script.
+    data_dir = Path("/root/.cache/nanochat/base_data")
+    existing = list(data_dir.glob("shard_*.parquet")) if data_dir.exists() else []
+    if len(existing) >= num_shards:
+        print(f"Dataset already has {len(existing)} shards, skipping download.")
+        return
+    print(f"Downloading {num_shards} dataset shards via nanochat.dataset...")
+    _uv_run(repo_dir, f"python -m nanochat.dataset -n {num_shards} -w 4")
+
 
 @app.function(
     image=image,
@@ -134,6 +172,8 @@ def run_speedrun(repo_ref: str = "master", model: str = "d12", force_restart: bo
     repo_dir = _setup_repo(repo_ref=repo_ref, repo_url="https://github.com/karpathy/nanochat.git")
     _ensure_uv_env_has_cuda_bits(repo_dir)
     _patch_speedrun_for_checkpoints(repo_dir, eval_interval=100)
+    _ensure_tokenizer(repo_dir)
+    _ensure_dataset(repo_dir)
 
     if force_restart:
         _run(f"rm -rf '{RUNS_DIR}/{model}'", cwd=repo_dir)
@@ -146,9 +186,9 @@ def run_speedrun(repo_ref: str = "master", model: str = "d12", force_restart: bo
     try:
         lib_paths = subprocess.check_output(["bash", "-lc", f"uv run python {helper_script_path}"], cwd=repo_dir, text=True).strip()
         sys_cuda = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
-        _run(f"export LD_LIBRARY_PATH={lib_paths}:{sys_cuda}:$LD_LIBRARY_PATH && export PYTHONPATH={repo_dir}:$PYTHONPATH && ./speedrun.sh {model}", cwd=repo_dir)
+        _run(f"export WANDB_MODE=disabled && export LD_LIBRARY_PATH={lib_paths}:{sys_cuda}:$LD_LIBRARY_PATH && export PYTHONPATH={repo_dir}:$PYTHONPATH && ./speedrun.sh {model}", cwd=repo_dir)
     except:
-        _run(f"export PYTHONPATH={repo_dir}:$PYTHONPATH && ./speedrun.sh {model}", cwd=repo_dir)
+        _run(f"export WANDB_MODE=disabled && export PYTHONPATH={repo_dir}:$PYTHONPATH && ./speedrun.sh {model}", cwd=repo_dir)
 
     vol.commit()
     return f"Done. Outputs in {RUNS_DIR}"
@@ -162,25 +202,18 @@ def run_speedrun(repo_ref: str = "master", model: str = "d12", force_restart: bo
 def smoke_test_10_steps(repo_ref: str = "master", model: str = "d12"):
     repo_dir = _setup_repo(repo_ref=repo_ref, repo_url="https://github.com/karpathy/nanochat.git")
     _ensure_uv_env_has_cuda_bits(repo_dir)
+    _ensure_tokenizer(repo_dir)
+    _ensure_dataset(repo_dir)
 
-    # Find the train script
-    script_path = _find_file("train.py", repo_dir)
-
-    # Build command based on what we find
-    if script_path:
-        rel = script_path.relative_to(repo_dir)
-        # Check if this is the newer argument-based script
-        if "scripts" in str(rel):
-            # This is likely scripts/base_train.py - use flags instead of config file
-            cmd = f"python {rel} --run=d12_test --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
-        else:
-            # This might be the older train.py - try with config
-            cmd = f"python {rel} config/{model}.py --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
-    elif (repo_dir / "scripts" / "base_train.py").exists():
-        cmd = f"python scripts/base_train.py --run=d12_test --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
+    if (repo_dir / "scripts" / "base_train.py").exists():
+        cmd = f"python scripts/base_train.py --run=d12_test --num-iterations=10 --core-metric-every=1 --eval-every=5 --save-every=5"
     else:
-        # Fallback to module import
-        cmd = f"python -m nanochat.train config/{model}.py --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
+        script_path = _find_file("train.py", repo_dir)
+        if script_path:
+            rel = script_path.relative_to(repo_dir)
+            cmd = f"python {rel} config/{model}.py --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
+        else:
+            cmd = f"python -m nanochat.train config/{model}.py --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
 
     _uv_run(repo_dir, cmd)
 

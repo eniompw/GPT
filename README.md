@@ -11,7 +11,8 @@ Run Andrej Karpathy's nanochat speedrun on Modal GPUs with persistent storage fo
 - Automatically resumes if a checkpoint exists
 - Provides a 10-step smoke test for quick validation
 - Uses NVIDIA CUDA + cuDNN base image for full GPU library support
-- **Robust dependency management**: Manually installs NVIDIA library wheels to prevent `torch` vs system library version mismatches.
+- **Robust dependency management**: Manually installs NVIDIA library wheels and Triton to prevent `torch` vs system library version mismatches.
+- **Auto-setup**: Automatically downloads the required tokenizer and dataset shards (via `python -m nanochat.dataset`) if missing, enabling a zero-config cold start.
 
 ## Prerequisites
 - A Modal account and configured CLI (`modal setup`)
@@ -42,6 +43,7 @@ What it does:
 - Runs 10 training steps
 - Saves a checkpoint every 5 steps
 - Verifies 8x H100 GPU communication and CUDA library linkage
+- Downloads necessary tokenizer and dataset files automatically
 - Takes ~5-10 minutes
 
 ### Full run (resumable)
@@ -101,12 +103,14 @@ modal run speedrun-d12.py --task run --repo-ref v1.0.0
 The Modal volume name is `nanochat-persistent-storage` and mounts at `/vol`.
 
 - **Checkpoints/logs**: `/vol/runs/<model>/ckpt.pt`
-- **Dataset cache**: `/vol/data/` (FineWeb, etc.)
+- **Dataset cache**: `~/.cache/nanochat/base_data/` (FineWeb-Edu parquet shards, inside the container)
+- **Volume data**: `/vol/data/` (symlinked into the repo for any additional data)
 
-Both datasets and checkpoints persist across runs, so:
-- Data is only downloaded once
+Both checkpoints and logs persist across runs via the Modal volume, so:
 - Training can resume from any checkpoint
-- Multiple runs share the same cached data
+- Multiple runs share the same volume storage
+
+> **Note:** The dataset shards are downloaded into the container's local filesystem (`~/.cache/nanochat/base_data/`), not the persistent volume. They are re-downloaded on each cold start (~2 shards for smoke tests, full dataset for speedruns). This matches nanochat's expected data layout.
 
 ## Monitoring
 
@@ -135,6 +139,18 @@ Or add a CLI argument by modifying the entrypoint.
 
 ## Troubleshooting
 
+### `FileNotFoundError: .../tokenizer.pkl`
+**Fixed in current version.**
+- The script includes `_ensure_tokenizer()` which downloads the required tokenizer files (`tokenizer.pkl`, `token_bytes.pt`) from HuggingFace to `~/.cache/nanochat/tokenizer/` if they are missing.
+
+### `No dataset parquet files found, did you run dataset.py?`
+**Fixed in current version.**
+- The script includes `_ensure_dataset()` which runs nanochat's built-in `python -m nanochat.dataset -n 2` to download FineWeb-Edu parquet shards to `~/.cache/nanochat/base_data/`. At least 2 shards are needed (the last is used for validation). For a full speedrun, increase `num_shards` or let `speedrun.sh` handle the full download.
+
+### `wandb: api_key not configured`
+**Fixed in current version.**
+- `WANDB_MODE=disabled` is now forced via environment variables and shell exports to prevent the training script from hanging on login prompts.
+
 ### `libcudart.so` / `libnvshmem_host.so` / `undefined symbol` errors
 **Fixed in current version.**
 - We explicitly install all NVIDIA library wheels (`nvidia-cudart-cu12`, `nvidia-nvshmem-cu12`, etc.) into the `uv` environment.
@@ -145,6 +161,10 @@ Or add a CLI argument by modifying the entrypoint.
 **Fixed in current version.**
 - Removed `uv pip install -e .` which caused issues with the flat repo structure.
 - Replaced with `PYTHONPATH` injection and a `.pth` file in site-packages.
+
+### `TritonMissing: Cannot find a working triton installation`
+**Fixed in current version.**
+- `triton` is now explicitly installed alongside the NVIDIA library wheels in `_ensure_uv_env_has_cuda_bits()`. This is required by `torch.compile` / `torch._inductor` which nanochat uses for performance.
 
 ### `base_train.py: error: unrecognized arguments`
 **Fixed in current version.**
@@ -171,6 +191,8 @@ If you want to bypass `speedrun.sh` entirely and run specific stages:
 def custom_train():
     repo_dir = _setup_repo("master", "https://github.com/karpathy/nanochat.git")
     _ensure_uv_env_has_cuda_bits(repo_dir)
+    _ensure_tokenizer(repo_dir) # Ensure artifacts exist
+    _ensure_dataset(repo_dir)
 
     # Run only base pretraining with custom args
     _uv_run(repo_dir,
