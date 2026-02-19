@@ -1,136 +1,102 @@
 # Nanochat Speedrun (Modal)
 
-Run Andrej Karpathy's nanochat speedrun on Modal GPUs with persistent storage for datasets, checkpoints, and logs.
+Run Andrej Karpathy's nanochat speedrun on Modal GPUs with persistent storage for datasets, tokenizer artifacts, checkpoints, and logs.
 
 ## What this does
-- **Instant Start**: Pre-bakes the nanochat repo, NVIDIA libraries, and tokenizer into the Modal image at deploy time — not at runtime.
-- **Fast Dependency Resolution**: Uses `uv` to create a fully resolved Python environment during the image build.
-- **Persistent Storage**: Maps a Modal volume to `/vol` for preserving checkpoints and logs across runs.
-- **Optimized for H100**: Uses 8x Nvidia H100 GPUs with Flash Attention 3 and `torch.compile`.
-- **Resumable**: nanochat's native checkpoint detection will resume from the last saved state in `/vol`.
-- **Live Log Streaming**: Uses `subprocess.Popen` to merge and stream stdout + stderr line-by-line in real time.
-- **Heartbeat Logging**: Prints a `[HEARTBEAT]` line every 30s during silent compilation phases so you know it hasn't crashed.
-- **Smoke Test included**: Validates the full stack (CUDA, NCCL, dataset, tokenizer) before committing to a full run.
+- Instant start: Pre-bakes the nanochat repo and dependencies into the Modal image (build-time, not runtime).
+- Fast dependency resolution: Uses uv during image build.
+- Cost-optimised: Downloads data/tokenizer on CPU first; smoke test uses 1×H100; full run uses 8×H100.
+- Persistent storage: Uses a Modal Volume mounted at /vol.
+- Resumable: Checkpoints + runs live under /vol/runs and can resume after preemption.
+- Live log streaming: Streams stdout+stderr in real time with a heartbeat during quiet phases.
+- Smoke test included: Runs a 10-step job to validate the full stack before doing a full run.
 
 ## Prerequisites
-- A Modal account and configured CLI (`modal setup`)
-- Access to H100 GPUs (configured in `speedrun-d12.py` via `GPU_CONFIG = "H100:8"`)
+- Modal account + CLI configured:
+  - pip install modal
+  - modal setup
+- H100 access on your Modal account.
 
-## Install Modal CLI
+## Quick start
 
-```bash
-pip install modal
-modal setup
-```
+### 1) Smoke test (recommended)
+Runs a 10-step training loop on 1×H100.
 
-## Quick Start
+Command:
+  modal run speedrun-d12.py --task test
 
-### 1. Smoke Test (Recommended First)
-Runs a 10-step training loop to validate CUDA, NCCL, dataset download, and tokenizer setup.
+Notes:
+- The first forward pass can be quiet while torch.compile/Inductor warms up; the script prints a [HEARTBEAT] line periodically.
+- If you’re using “modal run” (ephemeral app), memory snapshots are disabled; “modal deploy” enables them and can improve repeated starts.
 
-```bash
-modal run speedrun-d12.py --task test
-```
+### 2) Full speedrun
+Runs the full speedrun on 8×H100.
 
-> **Note**: `torch.compile` compiles Triton kernels on the first forward pass. This takes 2-4 minutes and is silent. A `[HEARTBEAT]` line will print every 30 seconds during this phase to confirm the process is alive.
-
-### 2. Full Speedrun
-
-```bash
-modal run speedrun-d12.py
-```
+Command:
+  modal run speedrun-d12.py
 
 To train a different model size:
-```bash
-modal run speedrun-d12.py --model d32
-```
+  modal run speedrun-d12.py --model d32
 
-## How It Works
+## How it works
 
-### Image Construction
-All heavy setup is done **once at deploy time**, not on every run. The `modal.Image` definition:
-1. Installs system dependencies (`git`, `build-essential`, etc.)
-2. Installs all Python dependencies via `pip` and `uv`, including all `nvidia-*` CUDA library wheels
-3. Clones the nanochat repo to `/root/nanochat` and runs `uv sync` with Python 3.11
-4. Pre-downloads the tokenizer (`tokenizer.pkl`, `token_bytes.pt`) from HuggingFace
-5. Sets a complete `LD_LIBRARY_PATH` covering all NVIDIA sub-packages
+### Image construction
+The Modal image build:
+1) Installs system deps (git, build tools, curl).
+2) Installs Python deps (including NVIDIA CUDA wheels) and syncs the nanochat venv with uv (Python 3.11).
+3) Clones nanochat into /root/nanochat.
+4) Sets LD_LIBRARY_PATH for NVIDIA wheels so Torch can find CUDA/NCCL/etc at runtime.
 
-When you run a function, the container boots in seconds with everything already installed.
+### Data + tokenizer persistence (important)
+nanochat’s paths are overridden by setting:
+  NANOCHAT_BASE_DIR=/vol
 
-### Log Streaming
-The `_run()` helper uses `subprocess.Popen` with `stderr=STDOUT` (merged streams) and `bufsize=1` (line-buffered). A background `_heartbeat` thread prints progress every 30 seconds if no output has appeared, ensuring you always know the process is alive during the silent `torch.compile` phase.
+With this, nanochat expects:
+- Dataset shards at: /vol/base_data/shard_*.parquet
+- Tokenizer files at: /vol/tokenizer/tokenizer.pkl and /vol/tokenizer/token_bytes.pt
 
-### Persistence
-The Modal Volume `nanochat-persistent-storage` mounts at `/vol`:
-- **Checkpoints**: `/vol/runs/<model_name>/`
-- **Logs**: `/vol/runs/<model_name>/`
+This repo provides CPU-only functions that ensure those exist before any GPU job runs:
+- ensure_tokenizer_on_volume: downloads tokenizer artifacts into /vol/tokenizer
+- download_dataset: downloads FineWeb-Edu shards into /vol/base_data
 
-Rerunning after a crash or timeout will automatically resume from the last checkpoint.
+Because they live on the Volume, subsequent runs should not re-download.
 
-### Dataset
-FineWeb-Edu shards download to `/root/.cache/nanochat/base_data` inside the container.
-- **Smoke Test**: Downloads 1 shard (~500MB) on first run.
-- **Full Run**: `speedrun.sh` handles the full dataset download automatically.
-- **Note**: The dataset lives on the container filesystem, not the volume. It re-downloads on each cold start. The `_ensure_dataset()` helper skips the download if shards already exist in the current container session.
+### Logging + heartbeat
+The script runs commands via subprocess.Popen with stderr merged into stdout, so you see exceptions immediately.
+A background thread prints [HEARTBEAT] every ~30s if there is no output (useful during compilation).
+
+### Outputs
+- Runs/checkpoints/logs: /vol/runs/<run_name_or_model>/
 
 ## Configuration
 
-### Changing GPUs
-```python
-GPU_CONFIG = "H100:8"  # 8x H100 (default)
-# GPU_CONFIG = "A100:8"  # 8x A100 (alternative)
-# GPU_CONFIG = "H100:4"  # 4x H100 (reduced cost)
-```
+### GPUs
+The script uses:
+- smoke_test_10_steps: gpu="H100:1"
+- run_speedrun: gpu="H100:8"
 
-### Force Restart
-To wipe checkpoints and start fresh, add `force_restart` to the `main` entrypoint:
+You can adjust those if you want cheaper/faster scheduling, but the “speedrun” baseline is designed around 8×H100.
 
-```python
-@app.local_entrypoint()
-def main(task: str = "run", model: str = "d12", force_restart: bool = False):
-    if task == "test":
-        print(smoke_test_10_steps.remote(model=model))
-    else:
-        print(run_speedrun.remote(model=model, force_restart=force_restart))
-```
-
-Then call:
-```bash
-modal run speedrun-d12.py --force-restart
-```
+### Force restart
+If your script supports it (force_restart parameter), you can wipe a run directory under /vol/runs and start fresh.
 
 ## Troubleshooting
 
-### Silent logs / apparent hang after model config printout
-`torch.compile` compiles Triton kernels on the first forward pass. This phase produces no output and takes 2-4 minutes on H100. The script handles this with a `[HEARTBEAT]` line printed every 30 seconds via a background thread. If you see heartbeats, the process is alive and compiling.
+### “No dataset parquet files found”
+This means nanochat can’t see /vol/base_data/shard_*.parquet.
+Fix: run the smoke test again (it calls download_dataset), and confirm the Volume is mounted at /vol.
 
-### `libcusparseLt.so.0` / `libnvshmem_host.so` / `libcupti` errors
-These are linker errors caused by missing entries in `LD_LIBRARY_PATH`. The current script explicitly includes:
-- `nvidia/cusparselt/lib`
-- `nvidia/nvshmem/lib`
-- `nvidia/cuda_cupti/lib`
-- All other `nvidia-*` sub-package lib paths
+### “FileNotFoundError: /vol/tokenizer/tokenizer.pkl”
+This means the tokenizer isn’t present in the Volume path nanochat expects.
+Fix: run the smoke test again (it calls ensure_tokenizer_on_volume), or manually place tokenizer.pkl and token_bytes.pt under /vol/tokenizer.
 
-Ensure you are on the latest version of the script. If you add new NVIDIA packages, add their lib paths to `LD_LIBRARY_PATH` in the same pattern.
+### Silent / slow start after printing model config
+torch.compile can take a couple of minutes the first time; watch for [HEARTBEAT] lines to confirm it’s alive.
 
-### Wrong Python version in venv (3.10 instead of 3.11)
-`uv` will download its own Python if not told otherwise. The script fixes this with:
-```bash
-uv sync --inexact --python /usr/local/bin/python3.11
-```
-and the env var `UV_PYTHON=/usr/local/bin/python3.11`.
-
-### Out Of Memory (OOM)
-Reduce device batch size in `smoke_test_10_steps`:
-```python
-"--device-batch-size=8"  # default is 16
-```
-
-## Cost Estimation
-- **Smoke Test**: < $5
-- **Full Run (d12)**: ~$150–$200 (H100 spot pricing, ~4 hours)
-
-Checkpoints save periodically so a preempted run can resume without losing significant progress.
+### Wrong Python version in venv
+uv may download its own Python if not pinned.
+Fix: ensure uv sync uses /usr/local/bin/python3.11 and set UV_PYTHON accordingly (as in speedrun-d12.py).
 
 ## License
-MIT / Apache 2.0 (same as nanochat)
+This runner script is provided as-is.
+nanochat itself is under its own license in the upstream repository.
