@@ -16,7 +16,7 @@ VOL_PATH = Path("/vol")
 RUNS_DIR = VOL_PATH / "runs"
 
 # nanochat derives all paths (dataset + tokenizer) under NANOCHAT_BASE_DIR
-# e.g. /vol/base_data and /vol/tokenizer [web:68]
+# e.g. /vol/base_data and /vol/tokenizer
 NANOCHAT_BASE_DIR = str(VOL_PATH)
 
 # --- NVIDIA library paths baked into image (python 3.11) ---
@@ -83,13 +83,15 @@ image = (
             "UV_PYTHON": "/usr/local/bin/python3.11",
             # Crucial: tells nanochat where to look for base_data/ and tokenizer/
             "NANOCHAT_BASE_DIR": NANOCHAT_BASE_DIR,
+            # Caching directories for torch.compile and triton mapped to the persistent volume
+            "TORCHINDUCTOR_CACHE_DIR": f"{NANOCHAT_BASE_DIR}/torch_cache",
+            "TRITON_CACHE_DIR": f"{NANOCHAT_BASE_DIR}/triton_cache",
         }
     )
 )
 
 REPO_DIR = Path("/root/nanochat")
 VENV_PYTHON = "/root/nanochat/.venv/bin/python"
-
 
 def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
     """Run a command, stream stdout+stderr in real time, print heartbeat if silent."""
@@ -134,7 +136,6 @@ def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
-
 @app.function(
     image=image,
     volumes={str(VOL_PATH): vol},
@@ -145,7 +146,7 @@ def ensure_tokenizer_on_volume():
     """
     Make sure /vol/tokenizer/tokenizer.pkl and token_bytes.pt exist.
 
-    With NANOCHAT_BASE_DIR=/vol, nanochat will try to load tokenizer from /vol/tokenizer [web:68].
+    With NANOCHAT_BASE_DIR=/vol, nanochat will try to load tokenizer from /vol/tokenizer.
     """
     tok_dir = VOL_PATH / "tokenizer"
     tok_dir.mkdir(parents=True, exist_ok=True)
@@ -164,7 +165,6 @@ def ensure_tokenizer_on_volume():
     vol.commit()
     return f"Tokenizer saved to {tok_dir}"
 
-
 @app.function(
     image=image,
     volumes={str(VOL_PATH): vol},
@@ -175,7 +175,7 @@ def download_dataset(num_shards: int):
     """
     Download parquet shards into the persistent Modal Volume.
 
-    With NANOCHAT_BASE_DIR=/vol, nanochat writes to /vol/base_data by default [web:68].
+    With NANOCHAT_BASE_DIR=/vol, nanochat writes to /vol/base_data by default.
     """
     target_dir = VOL_PATH / "base_data"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -195,13 +195,11 @@ def download_dataset(num_shards: int):
     vol.commit()
     return f"Downloaded {num_shards} shards into {target_dir}"
 
-
 @app.function(
     image=image,
     gpu="H100:8",
     timeout=24 * 60 * 60,
     volumes={str(VOL_PATH): vol},
-    enable_memory_snapshot=True,
 )
 def run_speedrun(model: str = "d12", force_restart: bool = False):
     if force_restart:
@@ -222,13 +220,11 @@ def run_speedrun(model: str = "d12", force_restart: bool = False):
     vol.commit()
     return f"Done. Outputs in {RUNS_DIR}"
 
-
 @app.function(
     image=image,
     gpu="H100:1",
     timeout=30 * 60,
     volumes={str(VOL_PATH): vol},
-    enable_memory_snapshot=True,
 )
 def smoke_test_10_steps(model: str = "d12"):
     print("Starting single-GPU smoke test...", flush=True)
@@ -252,7 +248,6 @@ def smoke_test_10_steps(model: str = "d12"):
 
     vol.commit()
     return "Smoke test complete."
-
 
 @app.local_entrypoint()
 def main(task: str = "run", model: str = "d12"):
