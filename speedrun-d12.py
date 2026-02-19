@@ -1,5 +1,7 @@
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 import modal
 
@@ -44,16 +46,11 @@ image = (
     .apt_install("git", "curl", "wget", "build-essential", "pkg-config", "findutils")
     .pip_install("uv", "transformers", "tiktoken", *NVIDIA_PACKAGES)
     .run_commands(
-        # Clone repo
         "git clone --depth 1 https://github.com/karpathy/nanochat.git /root/nanochat",
-        # Force uv to use system python3.11
         "cd /root/nanochat && uv sync --inexact --python /usr/local/bin/python3.11",
-        # Find speedrun.sh and ensure it's in the root
         "find /root/nanochat -name 'speedrun.sh' | head -1 | xargs -I{} cp {} /root/nanochat/speedrun.sh",
         "chmod +x /root/nanochat/speedrun.sh",
-        # Patch wandb disable
         "sed -i '1 a export WANDB_MODE=disabled' /root/nanochat/speedrun.sh",
-        # Pre-download tokenizer
         "mkdir -p /root/.cache/nanochat/tokenizer",
         "curl -L -o /root/.cache/nanochat/tokenizer/tokenizer.pkl "
             "https://huggingface.co/karpathy/nanochat-d32/resolve/main/tokenizer.pkl",
@@ -71,14 +68,54 @@ image = (
 
 
 REPO_DIR = Path("/root/nanochat")
+VENV_PYTHON = "/root/nanochat/.venv/bin/python"
 
 
 def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
+    """Run a command, stream stdout+stderr in real time, print heartbeat if silent."""
     base_env = os.environ.copy()
     if env:
         base_env.update(env)
+
     print(f"\n[EXEC] {cmd}\n", flush=True)
-    subprocess.run(["bash", "-lc", cmd], cwd=cwd, env=base_env, check=True)
+
+    proc = subprocess.Popen(
+        ["bash", "-lc", cmd],
+        cwd=cwd,
+        env=base_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout so nothing is lost
+        text=True,
+        bufsize=1,               # Line-buffered
+    )
+
+    last_output_time = time.time()
+    start_time = time.time()
+
+    def _heartbeat():
+        """Print a heartbeat every 30s if no output, so we know it's alive."""
+        while proc.poll() is None:
+            time.sleep(30)
+            silence = int(time.time() - last_output_time)
+            elapsed = int(time.time() - start_time)
+            if silence >= 30:
+                print(
+                    f"[HEARTBEAT] Still running... "
+                    f"(silent for {silence}s, total elapsed {elapsed}s)",
+                    flush=True,
+                )
+
+    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+    heartbeat_thread.start()
+
+    for line in proc.stdout:
+        last_output_time = time.time()
+        print(line, end="", flush=True)
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def _ensure_dataset(num_shards: int = 2) -> None:
@@ -108,12 +145,15 @@ def run_speedrun(model: str = "d12", force_restart: bool = False):
         _run(f"rm -rf '{RUNS_DIR}/{model}'")
 
     print(f"Starting training for {model}...", flush=True)
-    print("NOTE: The first few minutes may be silent due to torch.compile() shader compilation.", flush=True)
+    print("Heartbeat will print every 30s during silent torch.compile phases.", flush=True)
 
-    # Added python -u for unbuffered output to see logs faster
     _run(
-        f"export MODEL={model} && python -u ./speedrun.sh",
+        "./speedrun.sh",
         cwd=REPO_DIR,
+        env={
+            "MODEL": model,
+            "PYTHONUNBUFFERED": "1",
+        },
     )
 
     vol.commit()
@@ -129,24 +169,29 @@ def run_speedrun(model: str = "d12", force_restart: bool = False):
 )
 def smoke_test_10_steps(model: str = "d12"):
     _ensure_dataset(num_shards=1)
-    
-    print("Starting smoke test...", flush=True)
-    print("NOTE: The first 2-3 minutes will be silent while the H100 compiles kernels (torch.compile).", flush=True)
 
+    print("Starting smoke test...", flush=True)
+    print("Heartbeat will print every 30s during silent torch.compile phases.", flush=True)
+
+    # Use the venv Python directly — bypasses uv wrapper, no extra buffering layer
     if (REPO_DIR / "scripts" / "base_train.py").exists():
         cmd = (
-            "uv run --no-sync python -u scripts/base_train.py --run=d12_test "
+            f"{VENV_PYTHON} scripts/base_train.py --run=d12_test "
             "--num-iterations=10 --core-metric-every=1 "
             "--eval-every=5 --save-every=5 --device-batch-size=16"
         )
     else:
         cmd = (
-            f"uv run --no-sync python -u -m nanochat.train config/{model}.py "
+            f"{VENV_PYTHON} -m nanochat.train config/{model}.py "
             "--max_iters=10 --log_interval=1 "
             "--eval_interval=5 --always_save_checkpoint=True"
         )
 
-    _run(cmd, cwd=REPO_DIR)
+    _run(
+        cmd,
+        cwd=REPO_DIR,
+        env={"PYTHONUNBUFFERED": "1"},
+    )
 
     vol.commit()
     return "Smoke test complete."
