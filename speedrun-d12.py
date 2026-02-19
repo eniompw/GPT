@@ -3,23 +3,75 @@ import subprocess
 from pathlib import Path
 import modal
 
+
 APP_NAME = "nanochat-speedrun-h100"
 VOLUME_NAME = "nanochat-persistent-storage"
-GPU_CONFIG = "H100:8"
+GPU_CONFIG = "H100:1"
+
 
 app = modal.App(APP_NAME)
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+
 
 VOL_PATH = Path("/vol")
 RUNS_DIR = VOL_PATH / "runs"
 DATA_DIR = VOL_PATH / "data"
 
+
+# --- NVIDIA library paths baked into image (python 3.11) ---
+_NV = "/usr/local/lib/python3.11/site-packages/nvidia"
+LD_LIBRARY_PATH = (
+    f"{_NV}/cuda_runtime/lib:{_NV}/cuda_cupti/lib:"
+    f"{_NV}/cublas/lib:{_NV}/cudnn/lib:"
+    f"{_NV}/cufft/lib:{_NV}/curand/lib:{_NV}/cusolver/lib:"
+    f"{_NV}/cusparse/lib:{_NV}/cusparselt/lib:"
+    f"{_NV}/nccl/lib:{_NV}/nvtx/lib:{_NV}/nvshmem/lib:"
+    f"{_NV}/nvjitlink/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+)
+
+NVIDIA_PACKAGES = [
+    "nvidia-cuda-runtime-cu12", "nvidia-cuda-cupti-cu12", "nvidia-cuda-nvrtc-cu12",
+    "nvidia-cublas-cu12", "nvidia-cudnn-cu12", "nvidia-cufft-cu12", "nvidia-curand-cu12",
+    "nvidia-cusolver-cu12", "nvidia-cusparse-cu12", "nvidia-cusparselt-cu12",
+    "nvidia-nccl-cu12", "nvidia-nvtx-cu12", "nvidia-nvjitlink-cu12", "nvidia-nvshmem-cu12",
+    "triton",
+]
+
+
+# --- Image: all heavy setup baked in at build time ---
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git", "curl", "wget", "build-essential", "pkg-config", "findutils")
-    .pip_install("uv", "transformers", "tiktoken") # Added explicit deps just in case
-    .env({"WANDB_MODE": "disabled"})
+    .pip_install("uv", "transformers", "tiktoken", *NVIDIA_PACKAGES)
+    .run_commands(
+        # Clone repo
+        "git clone --depth 1 https://github.com/karpathy/nanochat.git /root/nanochat",
+        # Force uv to use system python3.11
+        "cd /root/nanochat && uv sync --inexact --python /usr/local/bin/python3.11",
+        # Find speedrun.sh and ensure it's in the root
+        "find /root/nanochat -name 'speedrun.sh' | head -1 | xargs -I{} cp {} /root/nanochat/speedrun.sh",
+        "chmod +x /root/nanochat/speedrun.sh",
+        # Patch wandb disable
+        "sed -i '1 a export WANDB_MODE=disabled' /root/nanochat/speedrun.sh",
+        # Pre-download tokenizer
+        "mkdir -p /root/.cache/nanochat/tokenizer",
+        "curl -L -o /root/.cache/nanochat/tokenizer/tokenizer.pkl "
+            "https://huggingface.co/karpathy/nanochat-d32/resolve/main/tokenizer.pkl",
+        "curl -L -o /root/.cache/nanochat/tokenizer/token_bytes.pt "
+            "https://huggingface.co/karpathy/nanochat-d32/resolve/main/token_bytes.pt",
+    )
+    .env({
+        "WANDB_MODE": "disabled",
+        "LD_LIBRARY_PATH": LD_LIBRARY_PATH,
+        "PYTHONPATH": "/root/nanochat",
+        "TOKENIZERS_PARALLELISM": "false",
+        "UV_PYTHON": "/usr/local/bin/python3.11",
+    })
 )
+
+
+REPO_DIR = Path("/root/nanochat")
+
 
 def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
     base_env = os.environ.copy()
@@ -28,138 +80,18 @@ def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
     print(f"\n[EXEC] {cmd}\n", flush=True)
     subprocess.run(["bash", "-lc", cmd], cwd=cwd, env=base_env, check=True)
 
-def _find_file(name: str, root: Path) -> Path | None:
-    try:
-        cmd = ["find", str(root), "-name", name, "-not", "-path", "*/.*/*"]
-        out = subprocess.check_output(cmd, text=True).strip().splitlines()
-        if out:
-            return Path(sorted(out, key=len)[0])
-    except Exception:
-        return None
-    return None
 
-def _setup_repo(repo_ref: str, repo_url: str) -> Path:
-    workdir = Path("/root/nanochat_work")
-    repo_dir = workdir / "nanochat"
-
-    _run(f"mkdir -p '{RUNS_DIR}' '{DATA_DIR}'")
-    if not repo_dir.exists():
-        _run(f"mkdir -p '{workdir}'")
-        _run(f"git clone --depth 1 '{repo_url}' '{repo_dir}'")
-
-    _run("git fetch --all --tags --prune", cwd=repo_dir)
-    _run(f"git checkout '{repo_ref}'", cwd=repo_dir)
-
-    _run(f"rm -rf data && ln -s '{DATA_DIR}' data", cwd=repo_dir)
-    _run(f"rm -rf logs && ln -s '{RUNS_DIR}' logs", cwd=repo_dir)
-
-    sr = _find_file("speedrun.sh", repo_dir)
-    if sr and sr.exists():
-        _run(f"chmod +x '{sr}'", cwd=repo_dir)
-        if sr.parent.name == "runs" and not (repo_dir / "speedrun.sh").exists():
-            _run("cp runs/speedrun.sh ./speedrun.sh && chmod +x ./speedrun.sh", cwd=repo_dir)
-
-    return repo_dir
-
-def _ensure_uv_env_has_cuda_bits(repo_dir: Path) -> None:
-    _run("uv sync --inexact", cwd=repo_dir)
-
-    _run(
-        f"uv run python -c \"import site, pathlib; "
-        f"p = pathlib.Path(site.getsitepackages()[0]) / 'nanochat_repo.pth'; "
-        f"p.write_text('{repo_dir}\\n')\"",
-        cwd=repo_dir,
-    )
-
-    print("Installing NVIDIA library wheels for PyTorch...")
-    packages = [
-        "nvidia-cuda-runtime-cu12", "nvidia-cuda-cupti-cu12", "nvidia-cuda-nvrtc-cu12",
-        "nvidia-cublas-cu12", "nvidia-cudnn-cu12", "nvidia-cufft-cu12", "nvidia-curand-cu12",
-        "nvidia-cusolver-cu12", "nvidia-cusparse-cu12", "nvidia-cusparselt-cu12",
-        "nvidia-nccl-cu12", "nvidia-nvtx-cu12", "nvidia-nvjitlink-cu12", "nvidia-nvshmem-cu12",
-        "triton",
-    ]
-    _run(f"uv pip install {' '.join(packages)}", cwd=repo_dir)
-
-def _uv_run(repo_dir: Path, cmd: str) -> None:
-    helper_script_path = repo_dir / "find_nvidia_libs.py"
-    if not helper_script_path.exists():
-        with open(helper_script_path, "w") as f:
-            f.write("""
-import os
-import site
-
-def find_libs():
-    libs = []
-    paths = site.getsitepackages() + [site.getusersitepackages()]
-    for p in paths:
-        if not p:
-            continue
-        nv_path = os.path.join(p, 'nvidia')
-        if os.path.exists(nv_path):
-            for d in os.listdir(nv_path):
-                lib_path = os.path.join(nv_path, d, 'lib')
-                if os.path.exists(lib_path):
-                    libs.append(lib_path)
-    print(':'.join(list(set(libs))))
-
-if __name__ == '__main__':
-    find_libs()
-""")
-
-    try:
-        lib_paths = subprocess.check_output(
-            ["bash", "-lc", f"uv run python {helper_script_path}"], cwd=repo_dir, text=True
-        ).strip()
-
-        sys_cuda = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
-        # Disable tokenizers parallelism to avoid deadlocks in forks
-        full_cmd = f"export TOKENIZERS_PARALLELISM=false && export WANDB_MODE=disabled && export LD_LIBRARY_PATH={lib_paths}:{sys_cuda}:$LD_LIBRARY_PATH && export PYTHONPATH={repo_dir}:$PYTHONPATH && uv run --no-sync {cmd}"
-        _run(full_cmd, cwd=repo_dir)
-    except subprocess.CalledProcessError:
-        _run(f"export WANDB_MODE=disabled && export PYTHONPATH={repo_dir}:$PYTHONPATH && uv run {cmd}", cwd=repo_dir)
-
-def _patch_speedrun_for_checkpoints(repo_dir: Path, eval_interval: int = 100) -> None:
-    sr = repo_dir / "speedrun.sh"
-    if not sr.exists(): return
-
-    flags = f" --eval-every={eval_interval} --save-every={eval_interval}"
-
-    _run("sed -i '1 a export WANDB_MODE=disabled' speedrun.sh", cwd=repo_dir)
-
-    for needle in ["scripts.base_train", "scripts.mid_train", "scripts.chat_sft", "python -m", "uv run"]:
-        _run(f"grep -q '{needle}' speedrun.sh && sed -i '/{needle}/ s/$/{flags}/' speedrun.sh || true", cwd=repo_dir)
-
-def _ensure_tokenizer(repo_dir: Path) -> None:
-    print("Ensuring tokenizer is present...")
-    tokenizer_dir = Path("/root/.cache/nanochat/tokenizer")
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
-
-    files = {
-        "tokenizer.pkl": "https://huggingface.co/karpathy/nanochat-d32/resolve/main/tokenizer.pkl",
-        "token_bytes.pt": "https://huggingface.co/karpathy/nanochat-d32/resolve/main/token_bytes.pt"
-    }
-
-    for filename, url in files.items():
-        filepath = tokenizer_dir / filename
-        if not filepath.exists():
-            print(f"Downloading {filename}...")
-            subprocess.run(["curl", "-L", "-o", str(filepath), url], check=True)
-        else:
-            print(f"{filename} already exists.")
-
-def _ensure_dataset(repo_dir: Path, num_shards: int = 2) -> None:
-    print("Ensuring dataset is present...")
-    # nanochat expects parquet shards in ~/.cache/nanochat/base_data/
-    # named shard_XXXXX.parquet. The last shard is used for validation,
-    # so we need at least 2. Run the built-in dataset download script.
+def _ensure_dataset(num_shards: int = 2) -> None:
     data_dir = Path("/root/.cache/nanochat/base_data")
     existing = list(data_dir.glob("shard_*.parquet")) if data_dir.exists() else []
     if len(existing) >= num_shards:
         print(f"Dataset already has {len(existing)} shards, skipping download.")
         return
-    print(f"Downloading {num_shards} dataset shards via nanochat.dataset...")
-    _uv_run(repo_dir, f"python -m nanochat.dataset -n {num_shards} -w 4")
+    print(f"Downloading {num_shards} dataset shards...")
+    _run(
+        f"uv run --no-sync python -m nanochat.dataset -n {num_shards} -w 4",
+        cwd=REPO_DIR,
+    )
 
 
 @app.function(
@@ -167,62 +99,62 @@ def _ensure_dataset(repo_dir: Path, num_shards: int = 2) -> None:
     gpu=GPU_CONFIG,
     timeout=24 * 60 * 60,
     volumes={str(VOL_PATH): vol},
+    enable_memory_snapshot=True,
 )
-def run_speedrun(repo_ref: str = "master", model: str = "d12", force_restart: bool = False):
-    repo_dir = _setup_repo(repo_ref=repo_ref, repo_url="https://github.com/karpathy/nanochat.git")
-    _ensure_uv_env_has_cuda_bits(repo_dir)
-    _patch_speedrun_for_checkpoints(repo_dir, eval_interval=100)
-    _ensure_tokenizer(repo_dir)
-    _ensure_dataset(repo_dir)
+def run_speedrun(model: str = "d12", force_restart: bool = False):
+    _ensure_dataset()
 
     if force_restart:
-        _run(f"rm -rf '{RUNS_DIR}/{model}'", cwd=repo_dir)
+        _run(f"rm -rf '{RUNS_DIR}/{model}'")
 
-    helper_script_path = repo_dir / "find_nvidia_libs.py"
-    if not helper_script_path.exists():
-         with open(helper_script_path, "w") as f:
-            f.write("import os, site; paths = site.getsitepackages() + [site.getusersitepackages()]; print(':'.join([os.path.join(p, 'nvidia', d, 'lib') for p in paths if p and os.path.exists(os.path.join(p, 'nvidia')) for d in os.listdir(os.path.join(p, 'nvidia')) if os.path.exists(os.path.join(p, 'nvidia', d, 'lib'))]))")
+    print(f"Starting training for {model}...", flush=True)
+    print("NOTE: The first few minutes may be silent due to torch.compile() shader compilation.", flush=True)
 
-    try:
-        lib_paths = subprocess.check_output(["bash", "-lc", f"uv run python {helper_script_path}"], cwd=repo_dir, text=True).strip()
-        sys_cuda = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
-        _run(f"export WANDB_MODE=disabled && export LD_LIBRARY_PATH={lib_paths}:{sys_cuda}:$LD_LIBRARY_PATH && export PYTHONPATH={repo_dir}:$PYTHONPATH && ./speedrun.sh {model}", cwd=repo_dir)
-    except:
-        _run(f"export WANDB_MODE=disabled && export PYTHONPATH={repo_dir}:$PYTHONPATH && ./speedrun.sh {model}", cwd=repo_dir)
+    # Added python -u for unbuffered output to see logs faster
+    _run(
+        f"export MODEL={model} && python -u ./speedrun.sh",
+        cwd=REPO_DIR,
+    )
 
     vol.commit()
     return f"Done. Outputs in {RUNS_DIR}"
+
 
 @app.function(
     image=image,
     gpu=GPU_CONFIG,
     timeout=30 * 60,
     volumes={str(VOL_PATH): vol},
+    enable_memory_snapshot=True,
 )
-def smoke_test_10_steps(repo_ref: str = "master", model: str = "d12"):
-    repo_dir = _setup_repo(repo_ref=repo_ref, repo_url="https://github.com/karpathy/nanochat.git")
-    _ensure_uv_env_has_cuda_bits(repo_dir)
-    _ensure_tokenizer(repo_dir)
-    _ensure_dataset(repo_dir)
+def smoke_test_10_steps(model: str = "d12"):
+    _ensure_dataset(num_shards=1)
+    
+    print("Starting smoke test...", flush=True)
+    print("NOTE: The first 2-3 minutes will be silent while the H100 compiles kernels (torch.compile).", flush=True)
 
-    if (repo_dir / "scripts" / "base_train.py").exists():
-        cmd = f"python scripts/base_train.py --run=d12_test --num-iterations=10 --core-metric-every=1 --eval-every=5 --save-every=5"
+    if (REPO_DIR / "scripts" / "base_train.py").exists():
+        cmd = (
+            "uv run --no-sync python -u scripts/base_train.py --run=d12_test "
+            "--num-iterations=10 --core-metric-every=1 "
+            "--eval-every=5 --save-every=5 --device-batch-size=16"
+        )
     else:
-        script_path = _find_file("train.py", repo_dir)
-        if script_path:
-            rel = script_path.relative_to(repo_dir)
-            cmd = f"python {rel} config/{model}.py --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
-        else:
-            cmd = f"python -m nanochat.train config/{model}.py --max_iters=10 --log_interval=1 --eval_interval=5 --always_save_checkpoint=True"
+        cmd = (
+            f"uv run --no-sync python -u -m nanochat.train config/{model}.py "
+            "--max_iters=10 --log_interval=1 "
+            "--eval_interval=5 --always_save_checkpoint=True"
+        )
 
-    _uv_run(repo_dir, cmd)
+    _run(cmd, cwd=REPO_DIR)
 
     vol.commit()
     return "Smoke test complete."
 
+
 @app.local_entrypoint()
-def main(task: str = "run", repo_ref: str = "master", model: str = "d12"):
+def main(task: str = "run", model: str = "d12"):
     if task == "test":
-        print(smoke_test_10_steps.remote(repo_ref=repo_ref, model=model))
+        print(smoke_test_10_steps.remote(model=model))
     else:
-        print(run_speedrun.remote(repo_ref=repo_ref, model=model))
+        print(run_speedrun.remote(model=model))

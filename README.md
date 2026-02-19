@@ -3,209 +3,108 @@
 Run Andrej Karpathy's nanochat speedrun on Modal GPUs with persistent storage for datasets, checkpoints, and logs.
 
 ## What this does
-- Clones the nanochat repo inside a Modal container
-- Checks out a specific branch/tag/commit
-- Creates persistent `data/` and `logs/` symlinks backed by a Modal volume
-- Uses 8x Nvidia H100 GPUs for maximum throughput
-- **Saves checkpoints every 100 training steps** for fine-grained resumability
-- Automatically resumes if a checkpoint exists
-- Provides a 10-step smoke test for quick validation
-- Uses NVIDIA CUDA + cuDNN base image for full GPU library support
-- **Robust dependency management**: Manually installs NVIDIA library wheels and Triton to prevent `torch` vs system library version mismatches.
-- **Auto-setup**: Automatically downloads the required tokenizer and dataset shards (via `python -m nanochat.dataset`) if missing, enabling a zero-config cold start.
+- **Instant Start**: Pre-bakes the nanochat repo, NVIDIA libraries, and tokenizer into the Modal image.
+- **Fast Development**: Uses `uv` for lightning-fast dependency resolution.
+- **Persistent Storage**: Maps a Modal volume to `/vol` for preserving checkpoints and logs across runs.
+- **Optimized for H100**: Uses 8x Nvidia H100 GPUs with `flash-attention` and `torch.compile`.
+- **Resumable**: Saves checkpoints periodically so you can resume training if interrupted.
+- **Smoke Test included**: Validates the H100 cluster setup in ~5 minutes before launching the full run.
 
 ## Prerequisites
 - A Modal account and configured CLI (`modal setup`)
-- Access to H100 GPUs (or modify `GPU_CONFIG` to use available GPUs like `A100:8`)
+- Access to H100 GPUs (configured in `speedrun-d12.py` via `GPU_CONFIG = "H100:8"`)
 
 ## Install Modal CLI
 If `modal` is not on your PATH, install it locally:
 
 ```bash
-python3 -m pip install --user modal
-```
-
-Then authenticate:
-
-```bash
-modal token new
+pip install modal
+modal setup
 ```
 
 ## Quick start
 
-### Smoke test (10 steps) - RECOMMENDED FIRST
-Verify your GPU setup and environment before running the full speedrun:
+### 1. Smoke test (Recommended)
+Verify your GPU setup and environment before committing to a full run. This runs a tiny 10-step training loop to ensure CUDA, NCCL, and the dataset are working.
+
 ```bash
 modal run speedrun-d12.py --task test
 ```
 
-What it does:
-- Runs 10 training steps
-- Saves a checkpoint every 5 steps
-- Verifies 8x H100 GPU communication and CUDA library linkage
-- Downloads necessary tokenizer and dataset files automatically
-- Takes ~5-10 minutes
+> **Note**: The first 2-3 minutes will be silent while `torch.compile` optimizes kernels for the H100. This is normal.
 
-### Full run (resumable)
-Start the full speedrun with checkpoint-every-100-steps:
+### 2. Full Speedrun
+Start the full training run.
+
 ```bash
 modal run speedrun-d12.py
 ```
 
-or explicitly:
+To run a specific model size (e.g., `d32` instead of `d12`):
 ```bash
-modal run speedrun-d12.py --task run
+modal run speedrun-d12.py --model d32
 ```
 
-**Resume behavior:** If the run crashes or times out, rerunning this command will automatically resume from `/vol/runs/d12/ckpt.pt`.
+## How it works
+
+### Image Construction
+Unlike typical scripts that install dependencies at runtime (slow), this project defines a robust `modal.Image` that:
+1. Installs system dependencies (`git`, `build-essential`, etc.)
+2. Installs Python dependencies via `uv` (`torch`, `transformers`, `numpy`, etc.)
+3. **Compiles/Installs NVIDIA Libraries**: Manually installs `nvidia-*` pip wheels and sets `LD_LIBRARY_PATH` to ensure `torch.compile` works perfectly.
+4. **Clones the Repo**: The `nanochat` code is baked into the image at `/root/nanochat`.
+5. **Pre-downloads Artifacts**: The tokenizer (`tokenizer.pkl`) is downloaded during the build.
+
+This means when you run the function, it starts in seconds, not minutes.
+
+### Persistence
+The script mounts a Modal Volume named `nanochat-persistent-storage` at `/vol`.
+- **Checkpoints**: Saved to `/vol/runs/<model_name>/`
+- **Logs**: Saved to `/vol/runs/<model_name>/`
+
+If the run is interrupted, you can restart it, and `nanochat`'s native checkpoint detection will resume from the last saved state in `/vol`.
+
+### Dataset
+The FineWeb-Edu dataset shards are downloaded to `/root/.cache/nanochat/base_data`.
+- **Smoke Test**: Downloads 1 shard (~500MB).
+- **Full Run**: Downloads the full dataset (handled automatically by `speedrun.sh`).
+- **Caching**: If the volume is populated, downloads are skipped.
 
 ## Configuration
 
-### Checkpoint frequency
-The code is configured to save checkpoints **every 100 steps** by default. This is controlled in two ways:
-
-1. **Patching `speedrun.sh`**: The script automatically injects `--eval-every=100 --save-every=100` into training commands
-2. **Direct arguments**: When resuming or running tests, these flags are passed explicitly
-
-To change the frequency, modify `eval_interval` in the `_patch_speedrun_for_checkpoints()` call inside `speedrun-d12.py`:
-```python
-_patch_speedrun_for_checkpoints(repo_dir, eval_interval=200)  # Save every 200 steps instead
-```
-
-### GPU configuration
-Change the GPU type/count by editing `GPU_CONFIG` at the top of `speedrun-d12.py`:
+### Changing GPUs
+Edit `GPU_CONFIG` at the top of `speedrun-d12.py`:
 ```python
 GPU_CONFIG = "H100:8"  # 8x H100 (default)
-# GPU_CONFIG = "A100:8"  # 8x A100 (alternative)
-# GPU_CONFIG = "H100:4"  # 4x H100 (reduced cost)
+# GPU_CONFIG = "A100:8"  # Alternative
 ```
 
-### Model size
-To train a different model variant (e.g., `d32` instead of `d12`), pass the `model` parameter:
+### Force Restart
+To wipe previous checkpoints and start fresh:
 ```bash
-modal run speedrun-d12.py --task run --model d32
+modal run speedrun-d12.py --force-restart
 ```
-
-Or modify the entrypoint defaults in the python file:
-```python
-@app.local_entrypoint()
-def main(task: str = "run", model: str = "d32", repo_ref: str = "master"):
-    # ...
-```
-
-### Branch/commit
-To use a specific nanochat version:
-```bash
-modal run speedrun-d12.py --task run --repo-ref v1.0.0
-```
-
-## Persistence layout
-The Modal volume name is `nanochat-persistent-storage` and mounts at `/vol`.
-
-- **Checkpoints/logs**: `/vol/runs/<model>/ckpt.pt`
-- **Dataset cache**: `~/.cache/nanochat/base_data/` (FineWeb-Edu parquet shards, inside the container)
-- **Volume data**: `/vol/data/` (symlinked into the repo for any additional data)
-
-Both checkpoints and logs persist across runs via the Modal volume, so:
-- Training can resume from any checkpoint
-- Multiple runs share the same volume storage
-
-> **Note:** The dataset shards are downloaded into the container's local filesystem (`~/.cache/nanochat/base_data/`), not the persistent volume. They are re-downloaded on each cold start (~2 shards for smoke tests, full dataset for speedruns). This matches nanochat's expected data layout.
-
-## Monitoring
-
-### View logs in real-time
-The Modal dashboard shows live stdout/stderr output.
-
-### Download logs locally
-```bash
-modal volume get nanochat-persistent-storage runs/d12/ ./local_logs/
-```
-
-### List volume contents
-```bash
-modal volume ls nanochat-persistent-storage runs/d12/
-```
-
-## Force restart
-To delete checkpoints and start fresh (ignoring previous progress):
-
-Edit `speedrun-d12.py` and change:
-```python
-run_speedrun.remote(repo_ref=repo_ref, model=model, force_restart=True)
-```
-
-Or add a CLI argument by modifying the entrypoint.
+*(Requires modifying the `main` entrypoint to accept this flag, or editing the default in the script)*
 
 ## Troubleshooting
 
-### `FileNotFoundError: .../tokenizer.pkl`
-**Fixed in current version.**
-- The script includes `_ensure_tokenizer()` which downloads the required tokenizer files (`tokenizer.pkl`, `token_bytes.pt`) from HuggingFace to `~/.cache/nanochat/tokenizer/` if they are missing.
+### "Silent" logs at start
+PyTorch 2.0+ uses `torch.compile` which performs "Just-In-Time" (JIT) compilation of CUDA kernels. This takes 2-4 minutes on the first step. The script now uses `python -u` (unbuffered) and prints a warning so you know it hasn't crashed.
 
-### `No dataset parquet files found, did you run dataset.py?`
-**Fixed in current version.**
-- The script includes `_ensure_dataset()` which runs nanochat's built-in `python -m nanochat.dataset -n 2` to download FineWeb-Edu parquet shards to `~/.cache/nanochat/base_data/`. At least 2 shards are needed (the last is used for validation). For a full speedrun, increase `num_shards` or let `speedrun.sh` handle the full download.
+### `libcusparseLt.so.0` / `libnvshmem_host.so` errors
+These are linker errors caused by missing paths in `LD_LIBRARY_PATH`. The image definition in `speedrun-d12.py` manually constructs the correct path including:
+- `nvidia/cusparselt/lib`
+- `nvidia/nvshmem/lib`
+- `nvidia/cuda_cupti/lib`
 
-### `wandb: api_key not configured`
-**Fixed in current version.**
-- `WANDB_MODE=disabled` is now forced via environment variables and shell exports to prevent the training script from hanging on login prompts.
+If you see these errors, ensure you are using the latest version of the script which includes these paths.
 
-### `libcudart.so` / `libnvshmem_host.so` / `undefined symbol` errors
-**Fixed in current version.**
-- We explicitly install all NVIDIA library wheels (`nvidia-cudart-cu12`, `nvidia-nvshmem-cu12`, etc.) into the `uv` environment.
-- We inject `LD_LIBRARY_PATH` dynamically to prioritize these wheels over system libraries.
-- This prevents version mismatches between PyTorch (which expects newer CUDA libs) and the base image.
+### Out Of Memory (OOM)
+If you hit OOM on H100s, try reducing the batch size in `speedrun.sh` or the `smoke_test` function arguments (e.g., `--device-batch-size=8`).
 
-### `Multiple top-level packages discovered` error
-**Fixed in current version.**
-- Removed `uv pip install -e .` which caused issues with the flat repo structure.
-- Replaced with `PYTHONPATH` injection and a `.pth` file in site-packages.
-
-### `TritonMissing: Cannot find a working triton installation`
-**Fixed in current version.**
-- `triton` is now explicitly installed alongside the NVIDIA library wheels in `_ensure_uv_env_has_cuda_bits()`. This is required by `torch.compile` / `torch._inductor` which nanochat uses for performance.
-
-### `base_train.py: error: unrecognized arguments`
-**Fixed in current version.**
-- The smoke test now correctly identifies usage of `scripts/base_train.py` (new argument style) vs `train.py` (old style).
-- Correctly maps arguments like `--max_iters` to `--num-iterations` and `--eval_interval` to `--eval-every` for the new script format.
-
-### GPU not available or queuing
-H100s are high-demand. If your job queues for >5 minutes:
-- Switch to `A100:8` or `H100:4`
-- Check Modal dashboard for GPU availability
-
-## Cost estimation
-- **8x H100**: ~$40-50/hour
-- **Full speedrun (d12)**: ~4 hours = **~$160-200 total**
-- **Smoke test**: ~$5-10
-
-Checkpointing every 100 steps ensures you can restart without losing >10 minutes of progress if preempted.
-
-## Advanced: Running custom training scripts
-If you want to bypass `speedrun.sh` entirely and run specific stages:
-
-```python
-@app.function(image=image, gpu=GPU_CONFIG, volumes={str(VOL_PATH): vol})
-def custom_train():
-    repo_dir = _setup_repo("master", "https://github.com/karpathy/nanochat.git")
-    _ensure_uv_env_has_cuda_bits(repo_dir)
-    _ensure_tokenizer(repo_dir) # Ensure artifacts exist
-    _ensure_dataset(repo_dir)
-
-    # Run only base pretraining with custom args
-    _uv_run(repo_dir,
-        "python scripts/base_train.py --run=d12_test "
-        "--num-iterations=5000 --eval-every=100 --device-batch-size=8"
-    )
-    vol.commit()
-```
-
-## References
-- [nanochat repo](https://github.com/karpathy/nanochat) by Andrej Karpathy
-- [Modal GPU docs](https://modal.com/docs/guide/gpu)
-- [Modal volumes guide](https://modal.com/docs/guide/volumes)
+## Cost Estimation
+- **Smoke Test**: < $5
+- **Full Run (d12)**: ~$150 - $200 (depending on spot pricing and duration)
 
 ## License
-This runner script is provided as-is. Check the [nanochat license](https://github.com/karpathy/nanochat/blob/master/LICENSE) for the training code itself.
+MIT / Apache 2.0 (Same as nanochat)
