@@ -59,26 +59,11 @@ modal run speedrun-d12.py --force-restart
 
 ## How it works
 
-The Modal image pre-bakes the nanochat repo, Python 3.11 venv (via `uv`), and NVIDIA CUDA wheels at build time. `LD_LIBRARY_PATH` is set so PyTorch finds CUDA/NCCL/etc at runtime.
+CPU-only setup functions download the tokenizer, eval bundle, and dataset before any GPU job starts — so you don't pay for GPU time during data download. On the first full run, `torch.compile` / Inductor may be quiet for several minutes while generating Triton kernels. A `[HEARTBEAT]` line prints every ~60s to confirm the process is alive. Subsequent runs load compiled kernels from the volume cache and start training immediately. Checkpoints save periodically so a preempted run can resume without losing significant progress.
 
-All data paths are controlled via `NANOCHAT_BASE_DIR` pointing to the persistent volume:
+> **Why Python 3.11?** nanochat requires `>=3.10` and Modal supports up to 3.14, but 3.11 is currently the most battle-tested version with PyTorch and CUDA tooling. If you want to bump to 3.12+, update `add_python`, the `_NV` site-packages path, and the `UV_PYTHON` / `uv sync --python` references in `speedrun-d12.py`.
 
-```
-/vol
-├── base_data/          # FineWeb-Edu parquet shards
-├── tokenizer/          # tokenizer.pkl + token_bytes.pt
-├── eval_bundle/        # ARC, MMLU, GSM8K, HumanEval benchmark data
-├── runs/               # checkpoints + logs per run
-└── cache/
-    ├── torch_cache/    # torch.compile / Inductor kernels
-    └── triton_cache/   # Triton autotuned kernels
-```
-
-CPU-only setup functions (`ensure_tokenizer_on_volume`, `download_dataset`) run before any GPU job so you don't pay for GPU time during data download.
-
-On the first full run, `torch.compile` / Inductor may be quiet for several minutes while generating Triton kernels. A `[HEARTBEAT]` line prints every ~60s to confirm the process is alive. Subsequent runs load compiled kernels from the volume cache and start training immediately.
-
-Checkpoints save periodically so a preempted run can resume without losing significant progress.
+For a detailed walkthrough of every function, the image build process, and the data flow, see **[speedrun-d12-explained.md](speedrun-d12-explained.md)**.
 
 ## Inspecting outputs
 
