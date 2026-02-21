@@ -71,6 +71,8 @@ image = (
         "TORCHINDUCTOR_CACHE_DIR":       "/tmp/torch_cache",
         "TRITON_CACHE_DIR":              "/tmp/triton_cache",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "TORCH_LOGS":                    "+dynamo,+inductor",
+        "TORCHINDUCTOR_VERBOSE":         "1",
         "PYTHONFAULTHANDLER":            "1",
     })
 )
@@ -90,6 +92,7 @@ def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
     )
     last_out = [time.time()]
     start = time.time()
+    cache_synced = [False]
 
     def _heartbeat():
         while proc.poll() is None:
@@ -102,6 +105,10 @@ def _run(cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
     for line in proc.stdout:
         last_out[0] = time.time()
         print(line, end="", flush=True)
+        if not cache_synced[0] and "Step 00001" in line:
+            print("[INFO] All compilations done, syncing caches to volume...", flush=True)
+            _sync_caches_out(vol)
+            cache_synced[0] = True
     proc.wait()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -179,7 +186,6 @@ def run_speedrun(model: str = "d12", force_restart: bool = False):
         env={"MODEL": model, "PYTHONUNBUFFERED": "1",
              "NANOCHAT_BASE_DIR": LOCAL_DATA_DIR, **_THREAD_ENV},
     )
-    _sync_caches_out(vol)
     _sync_runs_out(vol)
 
 

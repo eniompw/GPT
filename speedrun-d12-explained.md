@@ -57,6 +57,10 @@ Copies Torch Inductor and Triton compilation caches between the persistent volum
 
 > **What is torch.compile / Triton?** PyTorch's `torch.compile` analyses your model and generates optimised GPU kernels (via [Triton](https://github.com/triton-lang/triton), a compiler for writing GPU code). On the **first run**, this compilation step can take several minutes with no visible output — this is normal. The compiled kernels are cached to the volume (`/vol/cache/`) so subsequent runs skip compilation and start training immediately.
 
+> **Compilation phases:** There are actually **two** separate compilation phases. The first happens before Step 0 (~5 min) and compiles kernels for the **validation forward pass**. The second happens between Step 0 and Step 1 (~3 min) and compiles kernels for the **training forward+backward pass** (a different, larger computation graph). Together these take ~8 minutes on the first run. The cache sync is triggered after Step 1 appears in the output, so both sets of compiled kernels are saved to the persistent volume immediately — even if the training run is later interrupted or runs out of GPU credits.
+>
+> **Cache invalidation:** If the PyTorch or Triton version changes (e.g. `speedrun.sh` reinstalls `torch+cu128`), the caches will be invalidated and recompilation will happen again. Pinning exact package versions avoids this.
+
 #### `_sync_data_in()` / `_sync_runs_out()`
 - **In:** Copies dataset shards, tokenizer, and eval bundle from the volume to fast local disk before training.
 - **Out:** Copies training run outputs (checkpoints, logs) back to the volume after training.
