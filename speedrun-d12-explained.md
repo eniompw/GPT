@@ -4,9 +4,33 @@ This script uses [Modal](https://modal.com/) to run [Karpathy's nanochat](https:
 
 ## What is the Speedrun?
 
-The goal is to train a GPT-2 class language model (a text-generating transformer) as fast and cheaply as possible. [Karpathy's nanochat](https://github.com/karpathy/nanochat) provides optimised training code and a leaderboard — the "speedrun" is about reaching a target eval score in the fewest GPU-hours. The `d12` model is ~100M parameters and trains in roughly 10 minutes on 8× H100 GPUs.
+The goal is to train a GPT-2 class language model (a text-generating transformer) as fast and cheaply as possible. [Karpathy's nanochat](https://github.com/karpathy/nanochat) provides optimised training code and a leaderboard — the "speedrun" is about reaching a target eval score in the fewest GPU-hours.
 
 The training data is [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu), a large filtered web text dataset. The model learns to predict the next token (word piece) in a sequence — the same core technique behind GPT-2, GPT-3, and ChatGPT.
+
+The script patches `speedrun.sh` to use `--depth=12`, training a **d12 model (~135M total params)** — comparable in size to GPT-2 Small.
+
+### Model Size (d12)
+
+| Depth | model_dim | Heads | Scaling Params | Total Params | Comparable to |
+|---|---|---|---|---|---|
+| 12 | 768 | 6 | ~110M | ~135M | GPT-2 Small |
+
+- **Scaling params** = transformer matrices + lm_head (used for compute-optimal training calculations)
+- **Total params** = scaling params + embeddings + scalars
+- `model_dim = depth × 64` (aspect ratio), rounded up to nearest multiple of `head_dim=128`
+
+### Training Steps
+
+The number of iterations is computed dynamically at runtime:
+
+```
+target_tokens    = target_param_data_ratio × num_scaling_params = 8.25 × ~110M ≈ 907M tokens
+total_batch_size = auto-computed via power law scaling ≈ 2^19 = 524,288 tokens/step
+num_iterations   = target_tokens // total_batch_size ≈ 1,731 steps
+```
+
+With `--save-every=500`, checkpoints are saved at steps 500, 1000, 1500, plus a final checkpoint — roughly **4 checkpoints** total. These are written to local disk during training and only persisted to the Modal volume after the run completes (see [Checkpoints](#checkpoints)).
 
 ---
 

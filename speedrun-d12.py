@@ -59,6 +59,7 @@ image = (
         "chmod +x /root/nanochat/speedrun.sh",
         "sed -i '1 a export WANDB_MODE=disabled' /root/nanochat/speedrun.sh",
         "sed -i 's/base_train -- /base_train -- --save-every=500 --eval-every=200 /' /root/nanochat/speedrun.sh",
+        "sed -i 's/--depth=26/--depth=12/' /root/nanochat/speedrun.sh",
         "mkdir -p /root/.cache/nanochat/tokenizer",
     )
     .env({
